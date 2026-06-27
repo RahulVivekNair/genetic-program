@@ -2,7 +2,7 @@ from PIL import Image
 
 SIZE = 128
 
-img = Image.open("input/github.png")
+img = Image.open("input/openai.png")
 
 print(img.mode)   # Should print P
 

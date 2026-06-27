@@ -40,6 +40,11 @@ TARGET_ARRAY = np.array(TARGET, dtype=np.uint8)
 WORKER_SHARED_MEMORY = None
 WORKER_GENOMES = None
 
+_SERIAL_IMG = np.full((HEIGHT, WIDTH), 255, dtype=np.float32)
+_SERIAL_MASK = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+_SERIAL_TMP = np.empty((HEIGHT, WIDTH), dtype=np.float32)
+_SERIAL_OUT = np.empty((HEIGHT, WIDTH), dtype=np.uint8)
+
 
 class Individual:
     __slots__ = ("fitness", "genome", "points", "fills", "alphas")
@@ -91,13 +96,14 @@ def random_genome():
 
 # Optimized Rendering with Pre-allocated Masks
 def render_to_array(genome, points=None, fills=None, alphas=None, out=None):
-    img = np.full((HEIGHT, WIDTH), 255, dtype=np.float32)
+    img = _SERIAL_IMG
+    img.fill(255.0)
+    mask = _SERIAL_MASK
+    tmp = _SERIAL_TMP
 
     points = genome[:, :FILL].reshape(TRIANGLE_COUNT, 3, 2) if points is None else points
     fills = genome[:, FILL] if fills is None else fills
     alphas = genome[:, ALPHA] if alphas is None else alphas
-
-    mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
 
     for pts, fill, alpha in zip(points, fills, alphas):
         if alpha == 0:
@@ -109,12 +115,14 @@ def render_to_array(genome, points=None, fills=None, alphas=None, out=None):
 
         mask.fill(0)
         cv2.fillConvexPoly(mask, pts, 255)
-        bool_mask = mask > 0
 
-        a_f = np.float32(alpha) * np.float32(1.0 / 255.0)
-        inv_a_f = np.float32(1.0) - a_f
-        fill_f = np.float32(fill)
-        img[bool_mask] = img[bool_mask] * inv_a_f + fill_f * a_f
+        a = float(alpha) / 255.0
+        inv_a = 1.0 - a
+        c = float(fill) * a
+
+        np.multiply(img, inv_a, out=tmp)
+        tmp += c
+        cv2.copyTo(tmp, mask, img)
 
     if out is None:
         return img.astype(np.uint8)
@@ -137,11 +145,13 @@ def compute_genome_fitness(genome):
 
 
 def init_worker_shared_memory(name, shape):
-    global WORKER_SHARED_MEMORY, WORKER_GENOMES, WORKER_IMG_BUF, WORKER_MASK_BUF
+    global WORKER_SHARED_MEMORY, WORKER_GENOMES, WORKER_IMG_BUF, WORKER_MASK_BUF, WORKER_TMP_BUF, WORKER_OUT_BUF
     WORKER_SHARED_MEMORY = shared_memory.SharedMemory(name=name)
     WORKER_GENOMES = np.ndarray(shape, dtype=np.int32, buffer=WORKER_SHARED_MEMORY.buf)
     WORKER_IMG_BUF = np.full((HEIGHT, WIDTH), 255, dtype=np.float32)
     WORKER_MASK_BUF = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    WORKER_TMP_BUF = np.empty((HEIGHT, WIDTH), dtype=np.float32)
+    WORKER_OUT_BUF = np.empty((HEIGHT, WIDTH), dtype=np.uint8)
 
 
 def render_to_array_shared(genome):
@@ -151,6 +161,7 @@ def render_to_array_shared(genome):
     fills = genome[:, FILL]
     alphas = genome[:, ALPHA]
     mask = WORKER_MASK_BUF
+    tmp = WORKER_TMP_BUF
 
     for pts, fill, alpha in zip(points, fills, alphas):
         if alpha == 0:
@@ -160,22 +171,29 @@ def render_to_array_shared(genome):
             continue
         mask.fill(0)
         cv2.fillConvexPoly(mask, pts, 255)
-        bool_mask = mask > 0
-        a_f = np.float32(alpha) * np.float32(1.0 / 255.0)
-        inv_a_f = np.float32(1.0) - a_f
-        fill_f = np.float32(fill)
-        img[bool_mask] = img[bool_mask] * inv_a_f + fill_f * a_f
+        a = float(alpha) / 255.0
+        inv_a = 1.0 - a
+        c = float(fill) * a
+        np.multiply(img, inv_a, out=tmp)
+        tmp += c
+        cv2.copyTo(tmp, mask, img)
 
-    return img.astype(np.uint8)
+    out = WORKER_OUT_BUF
+    np.copyto(out, img, casting="unsafe")
+    return out
 
 
 def compute_shared_fitness_range(bounds):
     start, end = bounds
-    return [int(cv2.norm(render_to_array_shared(WORKER_GENOMES[i]), TARGET_ARRAY, cv2.NORM_L1)) for i in range(start, end)]
+    out = WORKER_OUT_BUF
+    target = TARGET_ARRAY
+    return [int(cv2.norm(render_to_array_shared(WORKER_GENOMES[i]), target, cv2.NORM_L1)) for i in range(start, end)]
 
 
 def compute_individual_fitness(individual):
-    return compute_fitness(render_to_array(individual.genome, individual.points, individual.fills, individual.alphas))
+    out = _SERIAL_OUT
+    render_to_array(individual.genome, individual.points, individual.fills, individual.alphas, out=out)
+    return compute_fitness(out)
 
 
 # GA operations
